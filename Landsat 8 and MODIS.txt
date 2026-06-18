@@ -1,0 +1,267 @@
+var ROI = henan.geometry();
+
+/****【 2. Landsat8 预处理 — Gao's NDWI: B5(NIR), B6(SWIR1) 】****/
+var prepareL8 = function(img) {
+  var sr = img.select(['SR_B5', 'SR_B6'])
+              .multiply(0.0000275).add(-0.2);
+  var qa = img.select('QA_PIXEL');
+  var validMask = qa.bitwiseAnd(1 << 3).eq(0)
+                    .and(qa.bitwiseAnd(1 << 4).eq(0))
+                    .and(qa.bitwiseAnd(1 << 5).eq(0));
+  return sr.normalizedDifference(['SR_B5', 'SR_B6'])
+           .rename('NDWI')
+           .updateMask(validMask)
+           .copyProperties(img, ['system:time_start']);
+};
+
+/****【 3. MODIS MCD43A4 预处理 — Band2(NIR), Band6(SWIR1) 】****/
+var prepareModis = function(img) {
+  var scaled = img.select(['Nadir_Reflectance_Band2','Nadir_Reflectance_Band6'])
+                  .multiply(0.0001);
+  return scaled.normalizedDifference(
+    ['Nadir_Reflectance_Band2','Nadir_Reflectance_Band6']
+  ).rename('NDWI').copyProperties(img, ['system:time_start']);
+};
+
+/****【 4. 填补函数：Landsat优先，空白用MODIS插值填补 】****/
+var fillNDWI = function(l8_ndwi, modis_ndwi) {
+  var modis_30m = modis_ndwi
+    .resample('bilinear')
+    .reproject({crs: 'EPSG:4326', scale: 30});
+  return l8_ndwi.unmask(modis_30m).rename('NDWI');
+};
+
+/****【 5. 月份列表 】****/
+var months = [
+  {y: 2023, m: 12},
+  {y: 2024, m: 1},
+  {y: 2024, m: 2},
+  {y: 2024, m: 3},
+  {y: 2024, m: 4},
+  {y: 2024, m: 5}
+];
+
+var ndwiVis = {
+  min: 0.0, max: 0.7,
+  palette: ['d73027','fc8d59','fee090','ffffbf','a6d96a','1a9850','00441b']
+};
+
+/****【 6. 主循环 】****/
+months.forEach(function(d) {
+  var start = ee.Date.fromYMD(d.y, d.m, 1);
+  var end   = start.advance(1, 'month');
+  var label = d.y + (d.m < 10 ? '0' : '') + d.m;
+
+  // ★ Landsat8 多源合并
+  var l8_T1 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(ROI).filterDate(start, end).map(prepareL8);
+  var l8_T2 = ee.ImageCollection('LANDSAT/LC08/C02/T2_L2')
+    .filterBounds(ROI).filterDate(start, end).map(prepareL8);
+  var extStart = start.advance(-15, 'day');
+  var extEnd   = end.advance(15, 'day');
+  var l8_ext = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(ROI).filterDate(extStart, extEnd).map(prepareL8);
+  var l8_all = l8_T1.merge(l8_T2).merge(l8_ext);
+  var hasL8  = l8_all.size().gt(0);
+
+  print(label + ' Landsat8总景数：', l8_all.size());
+
+  // MODIS 月均值
+  var modis_monthly = ee.ImageCollection('MODIS/061/MCD43A4')
+    .filterBounds(ROI).filterDate(start, end)
+    .map(prepareModis).mean();
+
+  var modis_fallback = modis_monthly
+    .resample('bilinear')
+    .reproject({crs: 'EPSG:4326', scale: 30})
+    .rename('NDWI');
+
+  // 逐景融合
+  var fused_col = l8_all.map(function(img) {
+    return fillNDWI(img.select('NDWI'), modis_monthly)
+           .copyProperties(img, ['system:time_start']);
+  });
+
+  var monthly_max = ee.Image(
+    ee.Algorithms.If(hasL8,
+      ee.ImageCollection(fused_col).max(),
+      modis_fallback)
+  ).rename('NDWI_max').toFloat().clip(ROI);
+
+  var monthly_min = ee.Image(
+    ee.Algorithms.If(hasL8,
+      ee.ImageCollection(fused_col).min(),
+      modis_fallback)
+  ).rename('NDWI_min').toFloat().clip(ROI);
+
+  var source_map = ee.Image(
+    ee.Algorithms.If(hasL8,
+      l8_all.map(function(img){
+        return img.mask().rename('source');
+      }).max().unmask(0),
+      ee.Image(0).rename('source'))
+  ).clip(ROI);
+
+  Map.addLayer(source_map,
+    {min:0, max:1, palette:['red','green']},
+    label + ' 数据来源(绿=Landsat8 红=MODIS)', false);
+  Map.addLayer(monthly_max, ndwiVis, label + ' NDWI_max');
+  Map.addLayer(monthly_min, ndwiVis, label + ' NDWI_min', false);
+
+  Export.image.toDrive({
+    image: monthly_max,
+    description: label + '_NDWI_max_30m_Henan',
+    folder: 'henan_ndwi_monthly',
+    fileNamePrefix: label + '_NDWI_max_30m_Henan',
+    region: ROI, scale: 30, crs: 'EPSG:4326', maxPixels: 1e13
+  });
+
+  Export.image.toDrive({
+    image: monthly_min,
+    description: label + '_NDWI_min_30m_Henan',
+    folder: 'henan_ndwi_monthly',
+    fileNamePrefix: label + '_NDWI_min_30m_Henan',
+    region: ROI, scale: 30, crs: 'EPSG:4326', maxPixels: 1e13
+  });
+
+  print(label + ' ✅ max + min 已提交');
+});
+
+Map.centerObject(ROI, 7);
+Map.addLayer(
+  henan.style({color:'red', fillColor:'00000000', width:2}),
+  {}, '河南省边界'
+); var ROI = henan.geometry();
+
+/****【 2. Landsat8 预处理 — Gao's NDWI: B5(NIR), B6(SWIR1) 】****/
+var prepareL8 = function(img) {
+  var sr = img.select(['SR_B5', 'SR_B6'])
+              .multiply(0.0000275).add(-0.2);
+  var qa = img.select('QA_PIXEL');
+  var validMask = qa.bitwiseAnd(1 << 3).eq(0)
+                    .and(qa.bitwiseAnd(1 << 4).eq(0))
+                    .and(qa.bitwiseAnd(1 << 5).eq(0));
+  return sr.normalizedDifference(['SR_B5', 'SR_B6'])
+           .rename('NDWI')
+           .updateMask(validMask)
+           .copyProperties(img, ['system:time_start']);
+};
+
+/****【 3. MODIS MCD43A4 预处理 — Band2(NIR), Band6(SWIR1) 】****/
+var prepareModis = function(img) {
+  var scaled = img.select(['Nadir_Reflectance_Band2','Nadir_Reflectance_Band6'])
+                  .multiply(0.0001);
+  return scaled.normalizedDifference(
+    ['Nadir_Reflectance_Band2','Nadir_Reflectance_Band6']
+  ).rename('NDWI').copyProperties(img, ['system:time_start']);
+};
+
+/****【 4. 填补函数：Landsat优先，空白用MODIS插值填补 】****/
+var fillNDWI = function(l8_ndwi, modis_ndwi) {
+  var modis_30m = modis_ndwi
+    .resample('bilinear')
+    .reproject({crs: 'EPSG:4326', scale: 30});
+  return l8_ndwi.unmask(modis_30m).rename('NDWI');
+};
+
+/****【 5. 月份列表 】****/
+var months = [
+  {y: 2023, m: 12},
+  {y: 2024, m: 1},
+  {y: 2024, m: 2},
+  {y: 2024, m: 3},
+  {y: 2024, m: 4},
+  {y: 2024, m: 5}
+];
+
+var ndwiVis = {
+  min: 0.0, max: 0.7,
+  palette: ['d73027','fc8d59','fee090','ffffbf','a6d96a','1a9850','00441b']
+};
+
+/****【 6. 主循环 】****/
+months.forEach(function(d) {
+  var start = ee.Date.fromYMD(d.y, d.m, 1);
+  var end   = start.advance(1, 'month');
+  var label = d.y + (d.m < 10 ? '0' : '') + d.m;
+
+  // ★ Landsat8 多源合并
+  var l8_T1 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(ROI).filterDate(start, end).map(prepareL8);
+  var l8_T2 = ee.ImageCollection('LANDSAT/LC08/C02/T2_L2')
+    .filterBounds(ROI).filterDate(start, end).map(prepareL8);
+  var extStart = start.advance(-15, 'day');
+  var extEnd   = end.advance(15, 'day');
+  var l8_ext = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(ROI).filterDate(extStart, extEnd).map(prepareL8);
+  var l8_all = l8_T1.merge(l8_T2).merge(l8_ext);
+  var hasL8  = l8_all.size().gt(0);
+
+  print(label + ' Landsat8总景数：', l8_all.size());
+
+  // MODIS 月均值
+  var modis_monthly = ee.ImageCollection('MODIS/061/MCD43A4')
+    .filterBounds(ROI).filterDate(start, end)
+    .map(prepareModis).mean();
+
+  var modis_fallback = modis_monthly
+    .resample('bilinear')
+    .reproject({crs: 'EPSG:4326', scale: 30})
+    .rename('NDWI');
+
+  // 逐景融合
+  var fused_col = l8_all.map(function(img) {
+    return fillNDWI(img.select('NDWI'), modis_monthly)
+           .copyProperties(img, ['system:time_start']);
+  });
+
+  var monthly_max = ee.Image(
+    ee.Algorithms.If(hasL8,
+      ee.ImageCollection(fused_col).max(),
+      modis_fallback)
+  ).rename('NDWI_max').toFloat().clip(ROI);
+
+  var monthly_min = ee.Image(
+    ee.Algorithms.If(hasL8,
+      ee.ImageCollection(fused_col).min(),
+      modis_fallback)
+  ).rename('NDWI_min').toFloat().clip(ROI);
+
+  var source_map = ee.Image(
+    ee.Algorithms.If(hasL8,
+      l8_all.map(function(img){
+        return img.mask().rename('source');
+      }).max().unmask(0),
+      ee.Image(0).rename('source'))
+  ).clip(ROI);
+
+  Map.addLayer(source_map,
+    {min:0, max:1, palette:['red','green']},
+    label + ' 数据来源(绿=Landsat8 红=MODIS)', false);
+  Map.addLayer(monthly_max, ndwiVis, label + ' NDWI_max');
+  Map.addLayer(monthly_min, ndwiVis, label + ' NDWI_min', false);
+
+  Export.image.toDrive({
+    image: monthly_max,
+    description: label + '_NDWI_max_30m_Henan',
+    folder: 'henan_ndwi_monthly',
+    fileNamePrefix: label + '_NDWI_max_30m_Henan',
+    region: ROI, scale: 30, crs: 'EPSG:4326', maxPixels: 1e13
+  });
+
+  Export.image.toDrive({
+    image: monthly_min,
+    description: label + '_NDWI_min_30m_Henan',
+    folder: 'henan_ndwi_monthly',
+    fileNamePrefix: label + '_NDWI_min_30m_Henan',
+    region: ROI, scale: 30, crs: 'EPSG:4326', maxPixels: 1e13
+  });
+
+  print(label + ' ✅ max + min 已提交');
+});
+
+Map.centerObject(ROI, 7);
+Map.addLayer(
+  henan.style({color:'red', fillColor:'00000000', width:2}),
+  {}, '河南省边界'
+);
